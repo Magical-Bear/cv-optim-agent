@@ -1,14 +1,11 @@
 import asyncio
-import uuid
-from io import BytesIO
-from typing import Annotated
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from langgraph.types import Command
 from pydantic import BaseModel
 
 from app.agents.graph import graph
+from app.agents.nodes import rewriter
 from app.agents.state import UserFeedback
 from app.config import settings
 from app.session import create_session, get_session
@@ -43,7 +40,7 @@ async def upload(file: UploadFile = File(...)):
 # ── /api/analyze ───────────────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
-    session_id: str
+    session_id: str | None = None
     resume_text: str
     jd_text: str
 
@@ -55,13 +52,21 @@ async def analyze(body: AnalyzeRequest):
     if not body.jd_text.strip():
         raise HTTPException(400, "jd_text is empty")
 
-    session = get_session(body.session_id)
-    if session is None:
-        raise HTTPException(404, "session_id not found or expired")
+    if body.session_id:
+        session = get_session(body.session_id)
+        if session is None:
+            raise HTTPException(404, "session_id not found or expired")
+        sid = body.session_id
+    else:
+        sid = create_session()
+        session = get_session(sid)
 
-    thread_id = body.session_id
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": sid}}
     session.graph_config = config
+    session.graph_state = {
+        "resume_text": body.resume_text,
+        "jd_text": body.jd_text,
+    }
 
     initial_state = {
         "resume_text": body.resume_text,
@@ -75,22 +80,18 @@ async def analyze(body: AnalyzeRequest):
     }
 
     try:
-        # runs until interrupt_before=["rewriter"]
         result = await asyncio.to_thread(graph.invoke, initial_state, config)
     except Exception as e:
         raise HTTPException(500, f"LangGraph failure: {e}")
 
-    # grab state after interrupt
-    snapshot = graph.get_state(config)
-    state_vals = snapshot.values
-
-    match_report = state_vals.get("match_report")
-    suggestions = state_vals.get("suggestions", [])
+    match_report = result.get("match_report")
+    suggestions = result.get("suggestions", [])
 
     session.match_report = match_report
     session.suggestions = suggestions
 
     return {
+        "session_id": sid,
         "match_report": match_report.model_dump() if match_report else {},
         "suggestions": [s.model_dump() for s in suggestions],
     }
@@ -119,21 +120,27 @@ async def confirm(body: ConfirmRequest):
     if session is None:
         raise HTTPException(404, "session_id not found or expired")
 
-    config = session.graph_config
     feedback = UserFeedback(
         selected_suggestions=body.selected_suggestions,
         edited_suggestions=[e.model_dump() for e in body.edited_suggestions],
         extra_note=body.extra_note,
     )
 
+    # call rewriter node directly with the stored graph state
+    state = {
+        **session.graph_state,
+        "suggestions": session.suggestions,
+        "user_feedback": feedback,
+        "resume_keywords": [],
+        "jd_keywords": [],
+        "match_report": session.match_report,
+        "optimized_resume": "",
+    }
+
     try:
-        result = await asyncio.to_thread(
-            graph.invoke,
-            Command(resume={"user_feedback": feedback}),
-            config,
-        )
+        result = await asyncio.to_thread(rewriter, state)
     except Exception as e:
-        raise HTTPException(500, f"LangGraph failure: {e}")
+        raise HTTPException(500, f"Rewriter failure: {e}")
 
     optimized = result.get("optimized_resume", "")
     session.optimized_resume = optimized
